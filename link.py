@@ -1,3 +1,48 @@
+import sys
+
+class Event:
+    
+    def __init__(self):
+        self.is_canceled = False
+
+    def perform(self):
+        sys.exit("Abstract method perform not implemented")
+
+class PacketArrivalEvent(Event):
+    """
+        packet: the Packet that is being transmitted
+        device: the Device on the other end of the link to which it's traveling
+        from_link: the Link on which the packet is arriving
+    """
+    def __init__(self, packet, device, from_link):
+        Event.__init__(self)
+        self.packet = packet
+        self.from_link = from_link
+        self.device = device
+
+    def perform(self):
+        self.device.handle_packet(self.packet, self.from_link)
+
+class LinkReadyEvent(Event):
+    """link: The Link that's busy until the next wake"""
+
+    def __init__(self, link):
+        Event.__init__(self)
+        self.link = link
+
+    def perform(self):
+        self.link.wake()
+
+class RoutingUpdateEvent(Event):
+    
+    def __init__(self, host):
+        Event.__init__(self)
+        self.host = host
+
+    def perform(self):
+        self.host.send_routing_packet()
+
+#########################
 class Buffer:
 	def __init__(self, size, link):
         self.available_space = size
