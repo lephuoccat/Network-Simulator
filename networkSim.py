@@ -1,13 +1,11 @@
 import time
-import _thread
+import threading
+import thread as _thread
 import math
-import queue
+import Queue as queue
 import random
+import cPickle
 
-#import matplotlib.pyplot as plt
-
-#add router class
-#check thoroughly for thread execution locks
 #Talk to TA whether this "virtual" packet is fine or not.
 global pktSize 
 pktSize = 1000
@@ -31,8 +29,17 @@ class Packet:
 		self.type = type
 		self.pktNum = pktNum
 		self.size = size
+
+	# Allow sending of routing table
+	# contents: String
+	def set_contents(self,contents) :
+		self.contents = contents
 		
 class Host(object):
+	######################################################################
+	##This host class can handle packets from one src/dst only. That is ##
+	##okay for our current simulation purposes.                         ##
+	######################################################################
 	def __init__(self,name,timeout):
 		self.pkt_num = 0
 		self.name = name
@@ -40,34 +47,51 @@ class Host(object):
 		self.timeout = timeout
 		##################################################################
 		##retransmitPhase: one entry maintained for each destination.   ##
-		##				   [0]: Is the flow in retransmit phase?        ##
-		##				   [1]: The destination of the flow.			##
+		##				   Is the flow in retransmit phase?             ##
 		##window:          one entry maintained per destination.        ##
-		##                 [0]: The window size for the src-dst pair.   ##
-		##                 [1]: The destination of the flow.            ##
+		##                 The window size for the src-dst pair.        ##
 		##lastAck:         one entry per destination.                   ##
 		##                 [0]:#pkt for last ack received fron the dst. ##
-		##                 [1]:The destination for the flow.            ##
-		##                 [2]:#times ack for the last pkt is received. ##
-		##lastPkt:         one entry per "active" packet.               ##
+		##                 [1]:#times ack for the last pkt is received. ##
+		##recPktQueue:     one entry per "active" packet.               ##
 		##outstandingCnt:  one entry per destination                    ##
 		##                 [0]: #unacknowledged packets for the src-dst ##
-		##				   [1]: Corresponding dst for the flow.         ##
 		##pktList:         one entry for each packet in flight.         ##
 		##                 [0]:Time at which pkt was sent.              ##
 		##                 [1]:Packet number of the packet.             ##
 		##                 [2]:Destination of the packet.               ##
 		##                 [3]:Size of the packet.                      ##
 		##################################################################
-		self.retransmitPhase = list()
-		self.window = list()
+		self.sstart = 0
+		self.retransmitPhase = 0
+		self.window = 50
+		self.maxPktNum = 1000
 		self.pktList = list()
-		self.lastAck = list()
-		self.lastPkt = list()
-		self.outstandingCnt = list()
-		self.pktLossCnt = 0		#improve this.
+		self.recAckQueue = list()
+		self.recPktQueue = list()
+		self.pktLost = list()
+		self.outstandingCnt = 0
+		self.pktLossCnt = 0
+		self.lastAckTime = 0
+		self.recExec = 0
+		self.flowSrc = ''
+		self.flowDst = ''
+		
+		self.pktListLock = threading.RLock()
+		self.recPktLock = threading.RLock()
+		self.recAckLock = threading.RLock()
+		self.windowChangeLock = threading.RLock()
+		
 		_thread.start_new_thread(self.timeout_check,(self.timeout,))
+		#_thread.start_new_thread(self.send_rem_ack,())
+		_thread.start_new_thread(self.pkt_retransmit,(self.flowDst,))
 		return
+
+	def __str__(self) :
+		return '<Host '+self.name+'>'
+
+	def __repr__(self) :
+		return self.__str__()
 		
 	#add link end specification	
 	def link_setup(self,a,b):
@@ -77,191 +101,402 @@ class Host(object):
 	
 	#Setup stuff for the flow. Creates a thread for flow_gen and returns immediately.
 	def flow_init(self,delay,dst,size):
-		try:
-			idx = [y[1] for y in self.window].index(dst)
-		except ValueError:
-			#self.window.append([1,dst])
-			self.window.append([30,dst])
-			idx = len(self.window)-1
-		t = _thread.start_new_thread(self.flow_gen,(delay,dst,size,idx))
+		self.window = 1
+		self.sstart = 1
+		t = _thread.start_new_thread(self.flow_gen,(delay,dst,size))
 		return 
 		
 	#Generates the packets of the flow.
 	#Packet generation rate to depend on window here.
-	def flow_gen(self,delay,dst,size,idx):
+	def flow_gen(self,delay,dst,size):
 		time.sleep(delay)
+		self.flowDst = dst
 		i = math.floor(size/pktSize)
 		lastPktSize = size - i*pktSize
-		try:
-			outstandingCnt_idx = [y[1] for y in self.outstandingCnt].index(dst)
-			retransmit_idx = [y[1] for y in self.retransmitPhase].index(dst)
-			self.retransmitPhase[retransmit_idx][0] = 0
-		except ValueError:
-			self.outstandingCnt.append([0,dst])
-			outstandingCnt_idx = len(self.outstandingCnt)-1
-			self.retransmitPhase.append([0,dst])
-			retransmit_idx = len(self.retransmitPhase)-1
-			
 		while i>0:
-			while self.outstandingCnt[outstandingCnt_idx][0] >= self.window[idx][0] or self.retransmitPhase[retransmit_idx][0] == 1:
-				time.sleep(0.0001)
-			
+			while self.outstandingCnt >= self.window or self.retransmitPhase == 1:
+				time.sleep(0.001)
+			###print('i',i,'Time',time.time()-time_start,'Control passed over to flow_gen')
 			self.pkt_gen(0,dst,0,self.pkt_num,pktSize)
 			self.pkt_num = self.pkt_num + 1
-			self.pktList.append([time.time()-time_start,self.pkt_num,dst,size])
-			self.outstandingCnt[outstandingCnt_idx][0] += 1
+			
+			self.pktListLock.acquire(1)
+			try:
+				self.pktList.append([time.time()-time_start,self.pkt_num,dst,pktSize])
+				#print('Append: Pkt list:',[y[1] for y in self.pktList])
+				self.outstandingCnt += 1
+			finally:
+				self.pktListLock.release()
+			
 			i = i-1
 			time.sleep(self.genDelay)
 		if lastPktSize != 0:
-			while self.outstandingCnt[outstandingCnt_idx][0] >= self.window[idx][0]:
+			while self.outstandingCnt >= self.window:
 				time.sleep(0.0001)
 			self.pkt_gen(0,dst,0,self.pkt_num,lastPktSize)
-			self.pktList.append([time.time()-time_start,self.pkt_num,dst,size])
-			self.outstandingCnt[outstandingCnt_idx][0] += 1
+			
+			self.pktListLock.acquire(1)
+			try:
+				self.pktList.append([time.time()-time_start,self.pkt_num,dst,lastPktSize])
+				#print('Append: Pkt list:',[y[1] for y in self.pktList])
+				self.outstandingCnt += 1
+			finally:
+				self.pktListLock.release()
+			
 			self.pkt_num = self.pkt_num + 1
+		###print('ALL PACKETS SENT:',self.pkt_num)
 		return
 		
 	def pkt_gen(self,delay,dst,type,pktNum,pktSize):
 		time.sleep(delay)
-		pkt = Packet(self.name,dst,type,pktNum)
+		pkt = Packet(self.name,dst,type,pktNum,pktSize)
 		
-		if pkt.type == 0:
-			print('Packet number sent by host:',self.name,pkt.pktNum,'Time:',(int)(time.time()-time_start),'window:',self.window,)
-		else:
-			print('Ack sent for packet number:',self.name,pkt.pktNum,'Time:',(int)(time.time()-time_start),'window:',self.window,)
-			
+		###if pkt.type == 0:
+			###print('Packet number sent by host:',self.name,pkt.pktNum,'Time:',"%0.2f" % (time.time()-time_start),'window:',self.window,)
+		###else:
+			###print('Ack sent for packet number:',self.name,pkt.pktNum,'Time:',"%0.2f" % (time.time()-time_start),'window:',self.window,)
+		
 		if self.outgoing_link_type == 0:
-			t = _thread.start_new_thread(self.outgoing_link.onreceive_dir0,(pkt,))	
+			self.outgoing_link.onreceive(pkt,0)	
 		else:
-			t = _thread.start_new_thread(self.outgoing_link.onreceive_dir1,(pkt,))	
+			self.outgoing_link.onreceive(pkt,1)	
 		return 
 		
-	#retransmits the dropped pkt.
-	def pkt_retransmit(self,pktNum,dst):
-		retransmit_idx = [y[1] for y in self.retransmitPhase].index(dst)
-		self.retransmitPhase[retransmit_idx][0] = 1
+	def send_rem_ack(self):
+		lastNum = 0
+		while 1:
+			if time.time()-self.lastAckTime > 10 & len(self.recPktQueue) != 0:
+				for f in range(len(self.recPktQueue)):
+					if f>0:
+						if self.recPktQueue[f] == self.recPktQueue[f-1]+1:
+							###print('REM_ACK_SEND')
+							self.pkt_gen(2,self.flowSrc,1,self.recPktQueue[f],64)
+							lastNum = self.recPktQueue[f]
+						else:
+							###print('REM_ACK_SEND')
+							self.pkt_gen(2,self.flowSrc,1,lastNum,64)
+					else:
+						self.pkt_gen(2,self.flowSrc,1,self.recPktQueue[0],64)
+				self.lastAckTime = time.time()
+			time.sleep(0.001)
+		return
 		
-		outstandingCnt_idx = [y[1] for y in self.outstandingCnt].index(dst)
-		idx = [y[1] for y in self.window].index(dst)
+	#retransmits the dropped packet only. 
+	#Waits for acknowledgement for the packet before exiting retransmitPhase.
+	#Only one lost packet can be detected at any given time.
+	def pkt_retransmit(self,dst):
+		retransmitList = list()
+		restart = 0
+		ackReceived = 0
 		
-		self.outstandingCnt[outstandingCnt_idx][0] = 0
-		while self.outstandingCnt[outstandingCnt_idx][0] >= self.window[idx][0]:
-			time.sleep(0.0001)
-		
-		idx1 = 	[[y[2],y[3]] for y in self.pktList].index([pktNum,dst])
-		self.pkt_gen(0,dst,0,nextPkt,self.pktList[idx1][3])
-		self.pktList[idx1][0] = time.time()-time_start
-		self.outstandingCnt[outstandingCnt_idx][0] += 1
-		nextPkt += 1
-		self.retransmitPhase[retransmit_idx][0] = 0
+		while 1:
+			if len(self.pktLost) != 0:
+				###print('Pkt lost list:',self.pktLost)
+				for i in range(len(self.pktLost)):
+					retransmit = 0
+					if restart == 1:
+						i = max(0,i-1)
+						restart = 0
+					try:
+						idx = [y[0] for y in retransmitList].index(self.pktLost[i][0])
+						if retransmitList[idx][1] < self.pktLost[i][1]:
+							retransmit = 1
+							currPkt = self.pktLost[i][0]
+							retransmitNum = self.pktLost[i][1]
+							retransmitList[idx][1] += 1
+					except ValueError:
+						retransmit = 1
+						currPkt = self.pktLost[i][0]
+						retransmitNum = self.pktLost[i][1]
+						retransmitList.append([self.pktLost[i][0],1])
+					
+					if retransmit == 1:
+						self.retransmitPhase = 1
+						###print('RETRANSMIT PHASE STARTED')
+						while self.outstandingCnt >= self.window:
+							time.sleep(0.0001)
+						try:
+							k = [y[1] for y in self.pktList].index(currPkt)
+							self.pkt_gen(0,dst,0,self.pktList[k][1],self.pktList[k][3])
+							self.pktList[k][0] = time.time()-time_start
+							self.outstandingCnt += 1
+							###print('Packet retransmitted:',self.pktList[k][1])
+						except ValueError:
+							pass	
+							
+						while 1:
+							try:
+								m = [y[0] for y in self.pktLost].index(currPkt)
+								if self.pktLost[m][1] > retransmitNum:
+									restart = 1
+									break
+							except ValueError:
+								ackReceived = 1
+								self.retransmitPhase = 0
+								###print('RETRANSMIT PHASE ENDED')
+								break
+							time.sleep(0.0001)
+							
+					if ackReceived == 1:
+						ackReceived = 0
+						break
+					time.sleep(0.001)
+			else:
+				time.sleep(0.001)
 		return
 		
 	def detect_pkt_loss(self,pktNum,src):
-		try: 
-			index = [y[1] for y in self.lastAck].index(src)
-			if pkt.pktNum == self.lastAck[index][0]:
-				self.lastAck[index][2] += 1
-				if self.lastAck[index][2] == 3:
-					self.change_window(1,src)
-					self.pktLossCnt += 1		#improve this.
-					_thread.start_new_thread(self.pkt_retransmit,(pktNum+1,src))
-			else if pkt.pktNum > self.lastAck[index][0]:
-				self.change_window(0,src)
-				self.lastAck[index][0] += 1
-				self.lastAck[index][2] = 1
-				pktIndex = [y[3] for y in self.pktList].index(src)
-				self.pktList.pop(pktIndex)
-				
-		except ValueError:
-				self.change_window(0,src)
-				self.lastPkt.append([pktNum,src,1])
-				
-		return
+		isPktLoss = 0
+		retransmit_idx = 0
 		
-	def pkt_receive(self,pkt):
-	#Figure out way to deal with trailing end of the simulation.
-	#A thread should have a lock on self.lastPkt.append at any given time. Need to serialize execution of threads there.
-	#Issue with ordering of acks otherwise.
-	#Send ack for last packet received w/o pkt loss.
-		if pkt.type == 0:
-			print('Packet number received by host:',self.name,pkt.pktNum,'Time:',(int)(time.time()-time_start),'window:',self.window,)
-			if len(self.lastPkt) != 0:
-				self.lastPkt.append(pkt.pktNum)
-				self.lastPkt.sort()	
-				if self.lastPkt[1] == self.lastPkt[0]+1:
-					ackNum = self.lastPkt[1]
-					self.lastPkt.remove(ackNum-1)
+		self.recAckLock.acquire(1)
+		try:
+			try:
+				idx = [y[0] for y in self.recAckQueue].index(pktNum)
+				if self.recAckQueue[idx][1] >= self.recAckQueue[idx][2]:
+					###print('PKT LOSS DETECTED','Time:',"%0.2f" % (time.time()-time_start))
+					isPktLoss = 1
+					try: 
+						k = [y[0] for y in self.pktLost].index(pktNum)
+						self.pktLost[k][1] += 1
+					except ValueError:
+						self.pktLost.append([pktNum+1,1])
+					
+					retransmit_idx = self.recAckQueue[idx][0]
+					self.recAckQueue[idx][2] = self.pktList[len(self.pktList)-1][1]-self.recAckQueue[idx][0]+3
 				else:
-					ackNum = self.lastPkt[0]
-			else:
-				self.lastPkt.append(pkt.pktNum)
-				ackNum = pkt.pktNum
-			t = _thread.start_new_thread(self.pkt_gen,(2,pkt.src,1,ackNum,64))
+					self.recAckQueue[idx][1] += 1
+			except ValueError:
+				i = [y[0] for y in self.recAckQueue if y[0] <= pktNum]
+				if len(i) == len(self.recAckQueue):
+					self.recAckQueue.append([pktNum,1,3])
+					self.recAckQueue.sort()
+		
+			self.change_window(isPktLoss,src)
+			#if self.realLoss == 1 or len(self.pktLost) == 0:
+			#	self.change_window(src)
+			
+			del_idx = [i for i in range(len(self.recAckQueue)) if self.recAckQueue[i][0] < pktNum]
+			for j in sorted(del_idx, reverse = True):
+				del self.recAckQueue[j]
+		
+			###print('recAckQueue',self.recAckQueue,'Time:',"%0.2f" % (time.time()-time_start))
+		
+		finally:
+			self.recAckLock.release()
+		
+		return
+	
+	#Send ack for last packet received w/o pkt loss.	
+	def pkt_receive(self,pkt):
+		#print('Pkt receive time:',time.time()-time_start)
+		last_inorder_idx = 0
+		if pkt.type == 0:
+			self.recPktLock.acquire(1)
+			try:
+				if self.flowSrc == '':
+					self.flowSrc = pkt.src
+				
+				###print('Packet number received by host:',self.name,pkt.pktNum,'Time:',"%0.2f" % (time.time()-time_start),'window:',self.window,)
+			
+				try:
+					idx = self.recPktQueue.index(pkt.pktNum)
+				except ValueError:
+					self.recPktQueue.append(pkt.pktNum)
+				if len(self.recPktQueue) != 0:
+					self.recPktQueue.sort()	
+			
+				###print('recPktQueue:',self.recPktQueue)
+				for i in range(len(self.recPktQueue)):
+					if i == len(self.recPktQueue) - 1:
+						last_inorder_idx = i
+					elif (self.recPktQueue[i+1] != self.recPktQueue[i]+1):
+						last_inorder_idx = i
+						break
+	
+				ackNum = self.recPktQueue[last_inorder_idx]
+			
+				if last_inorder_idx != 0:
+					del self.recPktQueue[0:last_inorder_idx-1]
+				#print('Ack Gen time:',time.time()-time_start)
+				self.pkt_gen(0,pkt.src,1,ackNum,64)
+				self.lastAckTime = time.time()
+			finally:
+				self.recPktLock.release()
+			
 		else:
-			self.detect_pkt_loss(pkt.pktNum,pkt.src)
-			print('Ack received for packet no:',self.name,pkt.pktNum,'Time:',(int)(time.time()-time_start),'window:',self.window,)
-			outstandingCnt_idx = [y[1] for y in self.outstandingCnt].index(pkt.src)
-			self.outstandingCnt[outstandingCnt_idx][0] -= 1
+			###print('Ack received for packet no:',self.name,pkt.pktNum,'Time:',"%0.2f" % (time.time()-time_start),'window:',self.window,)
+			self.outstandingCnt -= 1
+			
+			try:
+				idx1 = [i for i in range(len(self.pktLost)) if self.pktLost[i][0] <= pkt.pktNum]
+				for i in sorted(idx1, reverse=True):
+					del self.pktLost[i]
+			except ValueError:
+				pass
+			#print('Ack received for packet no:',self.name,pkt.pktNum,'Time:',"%0.2f" % (time.time()-time_start),'window:',self.window,)
+			self.pktListLock.acquire(1)
+			try:	
+				try:
+					idx = [i for i in range(len(self.pktList)) if self.pktList[i][1] <= pkt.pktNum]
+					for i in sorted(idx, reverse=True):
+						del self.pktList[i]
+				except ValueError:
+					pass
+			
+				self.detect_pkt_loss(pkt.pktNum,pkt.src)
+				###print('Ack received for packet no:',self.name,pkt.pktNum,'Time:',"%0.2f" % (time.time()-time_start),'window:',self.window,'outstandingCnt',self.outstandingCnt)
+			
+			finally:
+				self.pktListLock.release()
 		return
 	
 	#This changes according to the congestion control algorithm.
 	#Currently TCP Reno is implemented.
-	def change_window(self,isLoss,src):
-		i = [y[1] for y in self.window].index(src)
-		if isLoss:
-			#self.window[i][0] = math.ceil(self.window[i][0]/2)
-			self.window[i][0] = self.window[i][0] 
-		else:
-			self.window[i][0] = self.window[i][0] 
-			#self.window[i][0] = self.window[i][0] + 1
+	def change_window(self,pktLoss,src):
+		self.windowChangeLock.acquire(1)
+		try:
+			if pktLoss:
+				self.window = math.floor(self.window/2)
+				self.sstart = 0
+			else:
+				#self.window = self.window
+				if self.sstart == 1:
+					self.window = self.window + 1
+				else:
+					self.window = self.window + 1/self.window
+		finally:
+			self.windowChangeLock.release()
 		return
 		
 	#Add timeout mechanism
 	def timeout_check(self,timeout):
-		for i in range(len(self.pktList)):
-			if self.pktList[i][0] - (time.time()-time.start) >= timeout:
-				self.pkt_gen(0,self.pktList[i][2],0,self.pktList[i][1],self.pktList[i][3])
-				self.pktList[i][0] = time.time()-time.start
-				idx = [y[1] for y in self.window].index(self.pktList[i][2])
-				self.window[idx][0] = 1
+		while 1:
+			for y in self.pktList:
+				if time.time()-time_start - y[0] >= timeout:
+					###print('Timeout occured')
+					self.pktListLock.acquire(1)
+					try:
+						self.pkt_gen(0,y[2],0,y[1],y[3])
+						for l in self.pktList:
+							if l[1] >= y[1]:
+								l[0] = time.time()-time_start
+						self.outstandingCnt = 1
+					finally:
+						self.pktListLock.release()
+					
+					self.windowChangeLock.acquire(1)
+					try:
+						self.sstart = 1
+						self.window = 1
+					finally:
+						self.windowChangeLock.release()
+					
+					time.sleep(RTT)
+					###print('Timeout: Pkt retransmitted:',y[1],'Time:',"%0.2f" % (time.time()-time_start),'window:',self.window)
+					break
 		return
+
+class RouteInfo(object) :
+	def __init__(self,link,direction,distance) :
+		self.link = link
+		self.direction = direction
+		self.distance = distance
+
+	def __str__(self) :
+		return '['+str(self.link)+' '+str(self.direction)+' '+str(self.distance)+']'
+
+	def __repr__(self):
+		return self.__str__()
 
 class Router(object):
 	def __init__(self,name,updateFreq):
 		self.name = name
-		self.routing_table = list()
+		self.routing_table = {}
 		self.updateFreq = updateFreq
+		self.links = {}
+		_thread.start_new_thread(self.routing_update,(updateFreq,))
 		return
 		
-	def init_setup(self,routing_table):
+	#def init_setup(self,routing_table):
 		############Routing Table structure:##############
 		## |-----------|--------------|----------------|##
 		## |    dst    |    link      |     link-end   |##
 		## |-----------|--------------|----------------|##
 		##################################################
-		for item in routing_table:
-			self.routing_table.append(item)
-		_thread.start_new_thread(self.routing_update,(self.updateFreq,))
-		return
+		#self.routing_table = routing_table
+		#_thread.start_new_thread(self.routing_update,(self.updateFreq,))
+		#return
 	
 	def routing_update(self,updateFreq):
 		while 1:
+
+			# update immediate edges
+			for dest in self.links :
+				(link,direction) = self.links[dest]
+				linkBufferCost = link.buffer.size - link.buffer.available_space
+				self.routing_table[dest] = RouteInfo(link,direction,linkBufferCost)
+
+			# propogate to network
+			self.send_routing_table_to_neighbors()
+
 			time.sleep(updateFreq)
 		return
 	
 	def route(self,pkt):
-		table_index = [y[0] for y in self.routing_table].index(pkt.dst)	
-		if self.routing_table[table_index][2] == 0:
-			t = _thread.start_new_thread(self.routing_table[table_index][1].onreceive_dir0,(pkt,))	
-		else:
-			t = _thread.start_new_thread(self.routing_table[table_index][1].onreceive_dir1,(pkt,))	
+		route_info = self.routing_table[pkt.dst] #TODO was .name
+		#print 'name: '+self.name+'    ,src: '+pkt.src+'   ,dst: '+pkt.dst+'    ,table: '+str(self.routing_table)
+		route_info.link.onreceive(pkt,route_info.direction)	
 		return
 		
 	def update_table(self,pkt):
+		lastSender = pkt.contents[:pkt.contents.find('===')]
+		if len(pkt.contents[pkt.contents.find('===')+3:]) == 0 : # no routing table
+			return
+		sentRoutingTable = dict([entry.split(' ') for entry in pkt.contents[pkt.contents.find('===')+3:].split(',')])
+		#print 'srt',lastSender,sentRoutingTable
+		src = pkt.src
+		changedRouting = False
+
+		# recalculate all path costs that go through the lastSender if the distance was updated
+		for dest in self.routing_table :
+			if self.routing_table[dest].link.name == lastSender :
+				buff = self.routing_table[dest].link.buffer
+				if sentRoutingTable[dest] + (buff.size-buff.available_space) > self.routing_table[dest].distance :
+					self.routing_table[dest].distance = sentRoutingTable[dest] + (buff.size-buff.available_space)
+					changedRouting = True
+
+		# update table if shorter path exists through neighbor
+		for dest in sentRoutingTable :
+			if dest == self.name : # ignore path to self
+				continue
+			(link,direction) = self.links[lastSender]
+			linkBufferCost = link.buffer.size - link.buffer.available_space
+			routeCost = float(sentRoutingTable[dest])
+			if dest not in self.routing_table or routeCost + 1 + linkBufferCost < self.routing_table[dest].distance :
+				self.routing_table[dest] = RouteInfo(link, direction, float(sentRoutingTable[dest])+1)
+				changedRouting = True
+
+		# if table was changed, send updates to all neighbors
+		if changedRouting :
+			self.send_routing_table_to_neighbors()
 		return
-		
+
+	def send_routing_table_to_neighbors(self) :
+		routing_table_s = self.name+'==='+','.join([host+' '+str(self.routing_table[host].distance) for host in self.routing_table])
+		#print self.routing_table
+		for dest in self.links :
+			#print self,dest
+			new_pkt = Packet(self,dest,2,1,len(routing_table_s))
+			new_pkt.set_contents(routing_table_s)
+			(link,direction) = self.links[dest]
+			link.onreceive(new_pkt,direction)	
+		return
+
 	def pkt_receive(self,pkt):
-		print('Pkt received by router:',self.name,pkt.pktNum,'From:',pkt.src,'To:',pkt.dst)
+		#print 'pkt_receive'
+		#This should preferably be a constant delay function, since pkt_receive is in lockstep with link.propPkt. 
+		###print('Pkt received by router:',self.name,pkt.pktNum,'From:',pkt.src,'To:',pkt.dst)
 		if pkt.type == 2:
 			self.update_table(pkt)
 		else:
@@ -269,33 +504,49 @@ class Router(object):
 		return
 		
 class Buffer(object):
-	def __init__(self, size, link):
+	def __init__(self, size, name):
+		self.size = size
 		self.available_space = size
-		self.link = link
-		self.queue = queue.Queue()
+		self.queue = list()
 		self.drop_pkt = 0
 		self.itemsPut = 0
 		self.itemsPop = 0
+		self.name = name
+		self.queueLock = threading.RLock()
 		return
 
 	#place a packet in the buffer if there is space
 	#drop the packet if space== 0
 	def put(self, packet, destination):
-		if self.available_space >= packet.size:
-			self.queue.put_nowait((packet, destination))
-			self.available_space -= packet.size
-			self.itemsPut += 1
-		else:
-			print('Packet dropped:',packet.pktNum)
-			self.drop_pkt += 1
-            
+		self.queueLock.acquire(1)
+		try:
+			if self.available_space >= packet.size:
+				#print('Packet inserted:',packet.pktNum,packet.type)
+				self.queue.append((packet, destination))
+				#print([y[0].pktNum for y in self.queue],[y[1].name for y in self.queue])
+				self.available_space -= packet.size
+				self.itemsPut += 1
+			else:
+				#print('Packet dropped:',packet.pktNum,packet.type)
+				#print('Buf contents:',[pkt.pktNum for (pkt,dst) in self.queue])
+				self.drop_pkt += 1
+		finally:	
+			self.queueLock.release()
+		return
+		
 	#retrieve the next packet from the buffer in order.
 	def get(self):
-		(packet, destination) = self.queue.get_nowait()
-		self.available_space += packet.size
-		self.itemsPop += 1
+		self.queueLock.acquire()
+		try:
+			(packet, destination) = self.queue.pop(0)
+			#print('Get:',[y[0].pktNum for y in self.queue],[y[1].name for y in self.queue])
+			self.available_space += packet.size
+			self.itemsPop += 1
+			#print('Packet popped',packet.pktNum,destination.name)
+		finally:	
+			self.queueLock.release()
+		
 		return (packet, destination)
-        
         
 class biDirectionalLink(object):
 	#figure out something for queue ends. Behaviour depends on which queue end packet came from.
@@ -306,9 +557,10 @@ class biDirectionalLink(object):
 		self.dst_dir0 = dst
 		self.src_dir1 = dst
 		self.dst_dir1 = src
+		print type(src)
 		self.name = name
-		self.buffer_0 = Buffer(size, self)
-		self.buffer_1 = Buffer(size, self)
+		self.buffer_0 = Buffer(size, self.name+'Buf_0')
+		self.buffer_1 = Buffer(size, self.name+'Buf_1')
 		self.channel0Active = 1
 		self.channel1Active = 0
 		self.t0_start = time.time()
@@ -318,7 +570,7 @@ class biDirectionalLink(object):
 		_thread.start_new_thread(self.sendPkt,())
 		return
 		
-	def  activeChannel(self,start_delay):
+	def activeChannel(self,start_delay):
 		##switches between channels based on some arbitration scheme.
 		T = 5
 		poll_delay = 0.00001
@@ -327,13 +579,13 @@ class biDirectionalLink(object):
 			time.sleep(poll_delay)
 			if self.channel0Active == 1:
 				if (time.time() - self.t0_start >= T) or (self.buffer_0.itemsPut - self.buffer_0.itemsPop == 0 and self.buffer_1.itemsPut - self.buffer_1.itemsPop != 0):
-					print(self.name,'Channel switch',(int)(time.time()-time_start),)
+					#print(self.name,'Channel switch',"%0.2f" % (time.time()-time_start),)
 					self.t1_start = time.time()
 					self.channel0Active  = 0
 					self.channel1Active  = 1
 			else:
 				if (time.time() - self.t1_start >= T) or (self.buffer_1.itemsPut - self.buffer_1.itemsPop == 0 and self.buffer_0.itemsPut - self.buffer_0.itemsPop != 0):
-					print(self.name,'Channel switch',(int)(time.time()-time_start),)
+					#print(self.name,'Channel switch',"%0.2f" % (time.time()-time_start),)
 					self.t0_start = time.time()
 					self.channel0Active  = 1
 					self.channel1Active  = 0
@@ -341,8 +593,11 @@ class biDirectionalLink(object):
 		
 	def propPkt(self,pkt, dst):
 		#propagates the pkt through the link with propDelay delay.
+		#pkt_receive of both hosts and routers should be constant delay functions.
 		time.sleep(self.propDelay)
+		#print('Propagation delay completed')
 		dst.pkt_receive(pkt)
+		#print('Pkt_receive of sender exited')
 		return 
 		
 	def sendPkt(self):
@@ -351,7 +606,7 @@ class biDirectionalLink(object):
 		## spawn process for propPkt
 		while 1:
 			if self.channel0Active == 1:
-				#print(self.name,':Channel 0 active',(int)(time.time()-time_start))
+				#print(self.name,':Channel 0 active',"%0.2f" % (time.time()-time_start))
 				if self.buffer_0.itemsPut - self.buffer_0.itemsPop != 0:
 					(pkt, dst) = self.buffer_0.get()
 					transmission_delay = pkt.size / self.rate
@@ -360,26 +615,88 @@ class biDirectionalLink(object):
 				else:
 					time.sleep(0.00001)
 			if self.channel1Active == 1:
-				#print(self.name,':Channel 1 active',(int)(time.time()-time_start))
+				#print(self.name,':Channel 1 active',"%0.2f" % (time.time()-time_start))
 				if self.buffer_1.itemsPut - self.buffer_1.itemsPop != 0:
 					(pkt, dst) = self.buffer_1.get()
 					transmission_delay = pkt.size / self.rate
 					time.sleep(transmission_delay)
+					###print('Before thread start')
 					_thread.start_new_thread(self.propPkt,(pkt,dst))
+					###print('thread started')
 				else:
 					time.sleep(0.00001)
 		return
 		
 	def onreceive_dir0(self,pkt):
-		#print('Packet no. received by link:',self.name,pkt.pktNum,'Time:',(int)(time.time()-time_start))
+		#print('Packet no. received by link:',self.name,pkt.pktNum,'Time:',"%0.2f" % (time.time()-time_start))
 		self.buffer_0.put(pkt,self.dst_dir0)
+		###print('Channel 0 active:',self.channel0Active)
 		return
 		
 	def onreceive_dir1(self,pkt):
-		#print('Packet no. received by link:',self.name,pkt.pktNum,'Time:',(int)(time.time()-time_start))
+		#print('Packet no. received by link:',self.name,pkt.pktNum,'Time:',"%0.2f" % (time.time()-time_start))
 		self.buffer_1.put(pkt,self.dst_dir1)
 		return
 
+class biDirectionalLinkv2(object):
+	#figure out something for queue ends. Behaviour depends on which queue end packet came from.
+	def __init__(self,a,b,src,dst,size,name):
+		self.rate = a
+		self.propDelay = b
+		# TODO
+		if type(dst) == Router :
+			dst.routing_table[src.name] = RouteInfo(self,1,1)
+		if type(src) == Router  :
+			src.routing_table[dst.name] = RouteInfo(self,0,1)
+		if type(src) == Router :
+			src.links[dst.name] = (self,0)
+		if type(dst) == Router :
+			dst.links[src.name] = (self,1)
+
+		self.src_dir0 = src
+		self.dst_dir0 = dst
+		self.src_dir1 = dst
+		self.dst_dir1 = src
+		self.name = name
+		self.buffer = Buffer(size, self.name+'Buf')
+		#_thread.start_new_thread(self.activeChannel,(self.start_delay,))
+		_thread.start_new_thread(self.sendPkt,())
+		return
+
+	def __str__(self) :
+		return '<Link '+self.name+'>'
+
+	def __repr__(self) :
+		return self.__str__()
+		
+	def propPkt(self,pkt, dst):
+		#propagates the pkt through the link with propDelay delay.
+		#pkt_receive of both hosts and routers should be constant delay functions.
+		time.sleep(self.propDelay)
+		#print('End propagation')
+		dst.pkt_receive(pkt)
+		return 
+		
+	def sendPkt(self):
+		while 1:
+			if len(self.buffer.queue)!=0:
+				(pkt, dst) = self.buffer.get()
+				transmission_delay = pkt.size / self.rate
+				time.sleep(transmission_delay)
+				#print('Start propagation')
+				_thread.start_new_thread(self.propPkt,(pkt,dst))
+			else:
+				time.sleep(0.0001)
+		return
+		
+	def onreceive(self,pkt,dir):
+		#print 'onreceive'
+		if dir == 0:
+			self.buffer.put(pkt,self.dst_dir0)
+		else:
+			self.buffer.put(pkt,self.dst_dir1)
+		return
+		
 class uniDirectionalLink(object):
 	def __init__(self,a,b,src,dst,size,name):
 		self.transDelay = a
@@ -390,18 +707,35 @@ class uniDirectionalLink(object):
 		self.bufSize = size
 	
 	def onreceive(self,pkt):
-		print('Packet no. received by link:',self.name,pkt.pktNum,'Time:',(int)(time.time()-time_start))
+		###print('Packet no. received by link:',self.name,pkt.pktNum,'Time:',"%0.2f" % (time.time()-time_start))
 		time.sleep(self.transDelay+self.propDelay)
 		t = _thread.start_new_thread(self.dst.pkt_receive,(pkt,))
 		return
-		
+
+def variable_poll():
+	while 1:
+		#print('H1.window:',H1.window)
+		#print('H1.retransmit_phase',H1.retransmitPhase,'H1.sstart',H1.sstart,'H1.outstandingCnt',H1.outstandingCnt,'H1.window',H1.window,'Time:',"%0.2f" % (time.time()-time_start))
+		#print('H1.pktList',[y[1] for y in H1.pktList])
+		#print('H2.recPktQueue',H2.recPktQueue)
+		#print('H1.recAckQueue',H1.recAckQueue)
+		#print('L1 Buf',[y[0].pktNum for y in L1.buffer.queue],[y[1].name for y in L1.buffer.queue])
+		time.sleep(0.01)
+	return
+	
 def test0():
 	#Host initialization.
-	H1 = Host('H1',30)
-	H2 = Host('H2',30)
+	global RTT
+	RTT = 0.04
+	global H1
+	H1 = Host('H1',200*RTT)
+	global H2
+	H2 = Host('H2',200*RTT)
 		
 	#Link Initialization.
-	L1 = biDirectionalLink((10e6)/8,0.01,H1,H2,32*(10e2),'L1',0)
+	global L1
+	#L1 = biDirectionalLink((10e6)/8,0.01,H1,H2,32*(10e2),'L1',0)
+	L1 = biDirectionalLinkv2((10e6)/8,0.01,H1,H2,64*(10e2),'L1')
 		
 	#Link setup for hosts.
 	H1.link_setup(L1,0)
@@ -410,46 +744,162 @@ def test0():
 	#Start of simulation.
 	global time_start
 	time_start = time.time()
-	H1.flow_init(1.0,'H2',20*(10e5))	
-	time.sleep(1500)
+
+	t = _thread.start_new_thread(variable_poll,())
+	
+	H1.flow_init(1.0,'H2',20*(10e4))	
+	time.sleep(70)
 	return
 		
 def test1():
+	global RTT
+	RTT = 0.06
+	
 	#Host initialization.
-	H1 = Host('H1',30)			#30: Timeout time (in s)
-	H2 = Host('H2',30)
+	global H1
+	H1 = Host('H1',RTT*150)			
+	global H2
+	H2 = Host('H2',RTT*150)
 		
 	#Router initialization.
-	R1 = Router('R1',10)		#10: Routing Table update freq (in s)
-	R2 = Router('R2',10)
-	R3 = Router('R3',10)
-	R4 = Router('R4',10)
+	global R1
+	R1 = Router('R1',1)		#10: Routing Table update freq (in s)
+	global R2
+	R2 = Router('R2',1)
+	global R3
+	R3 = Router('R3',1)
+	global R4
+	R4 = Router('R4',1)
 		
 	#Link initialization.
-	L0 = biDirectionalLink(0.125*12.5*10e5,0.01,H1,R1,32*10e2,'L0',0)  
-	L1 = biDirectionalLink(0.125*10*10e5,0.01,R1,R2,32*10e2,'L1',1)
-	L2 = biDirectionalLink(0.125*10*10e5,0.01,R1,R3,32*10e2,'L2',0.5)
-	L3 = biDirectionalLink(0.125*10*10e5,0.01,R2,R4,32*10e2,'L3',2)
-	L4 = biDirectionalLink(0.125*10*10e5,0.01,R3,R4,32*10e2,'L4',3)
-	L5 = biDirectionalLink(0.125*12.5*10e5,0.01,R4,H2,32*10e2,'L5',2.6)
-		
+	global L0
+	L0 = biDirectionalLinkv2(0.125*12.5*10e5,0.01,H1,R1,64*10e2,'L0')  
+	global L1
+	L1 = biDirectionalLinkv2(0.125*10*10e5,0.01,R1,R2,64*10e2,'L1')
+	global L2
+	L2 = biDirectionalLinkv2(0.125*10*10e5,0.01,R1,R3,64*10e2,'L2')
+	global L3
+	L3 = biDirectionalLinkv2(0.125*10*10e5,0.01,R2,R4,64*10e2,'L3')
+	global L4
+	L4 = biDirectionalLinkv2(0.125*10*10e5,0.01,R3,R4,64*10e2,'L4')
+	global L5
+	L5 = biDirectionalLinkv2(0.125*12.5*10e5,0.01,R4,H2,64*10e2,'L5')
+	
 	#outgoing link end specification for hosts
 	H1.link_setup(L0,0)
 	H2.link_setup(L5,1)
+
+	print R1.routing_table
+	print R2.routing_table
+	print R3.routing_table
+	print R4.routing_table
+
+	R1.send_routing_table_to_neighbors()
+	R2.send_routing_table_to_neighbors()
+	R3.send_routing_table_to_neighbors()
+	R4.send_routing_table_to_neighbors()
+
+	#Routing tables for the routers.
+	#R1.init_setup({'H2':[L1,0,0],'H1':[L0,1,0]});
+	#R2.init_setup({'H2':[L3,0,0],'H1':[L1,1,0]});
+	#R3.init_setup({'H2':[L4,0,0],'H1':[L2,1,0]});
+	#R4.init_setup({'H2':[L5,0,0],'H1':[L4,1,0]});
+	
+
+	#Start of simulation.
+	global time_start
+	time_start = time.time()
+
+	t = _thread.start_new_thread(variable_poll,())
+
+	H1.flow_init(0.5,'H2',20*(10e4))	
+
+
+	for i in range(10) :
+		time.sleep(1)
+		print R1.routing_table
+		print R2.routing_table
+		print R3.routing_table
+		print R4.routing_table
+		print ''
+
+	time.sleep(130)
+	return
+	
+def test2():
+	global RTT
+	RTT = 0.06
+	
+	#Host initialization.
+	global S1
+	S1 = Host('S1',RTT*150)	
+	global S2
+	S2 = Host('S2',RTT*150)
+	global S3
+	S3 = Host('S3',RTT*150)	
+	global T1
+	T1 = Host('T1',RTT*150)	
+	global T2
+	T2 = Host('T2',RTT*150)	
+	global T3
+	T3 = Host('T3',RTT*150)		
+		
+	#Router initialization.
+	global R1
+	R1 = Router('R1',10)		#10: Routing Table update freq (in s)
+	global R2
+	R2 = Router('R2',10)
+	global R3
+	R3 = Router('R3',10)
+	global R4
+	R4 = Router('R4',10)
+		
+	#Link initialization.
+	global L0
+	L0 = biDirectionalLinkv2(0.125*12.5*10e5,0.01,S2,R1,128*10e2,'L0')  
+	global L1
+	L1 = biDirectionalLinkv2(0.125*10*10e5,0.01,R1,R2,128*10e2,'L1')
+	global L2
+	L2 = biDirectionalLinkv2(0.125*10*10e5,0.01,R2,R3,128*10e2,'L2')
+	global L3
+	L3 = biDirectionalLinkv2(0.125*10*10e5,0.01,R3,R4,128*10e2,'L3')
+	global L4
+	L4 = biDirectionalLinkv2(0.125*12.5*10e5,0.01,S1,R1,128*10e2,'L4')
+	global L5
+	L5 = biDirectionalLinkv2(0.125*12.5*10e5,0.01,R2,T2,128*10e2,'L5')
+	global L6
+	L6 = biDirectionalLinkv2(0.125*12.5*10e5,0.01,S3,R3,128*10e2,'L5')
+	global L7
+	L7 = biDirectionalLinkv2(0.125*12.5*10e5,0.01,R4,T1,128*10e2,'L5')
+	global L8
+	L8 = biDirectionalLinkv2(0.125*12.5*10e5,0.01,R4,T3,128*10e2,'L5')
+		
+	#outgoing link end specification for hosts
+	S1.link_setup(L4,0)
+	S2.link_setup(L0,0)
+	S3.link_setup(L6,0)
+	T1.link_setup(L7,1)
+	T2.link_setup(L5,1)
+	T3.link_setup(L8,1)
 		
 	#Routing tables for the routers.
-	R1.init_setup([['H2',L1,0],['H1',L0,1]]);
-	R2.init_setup([['H2',L3,0],['H1',L1,1]]);
-	R3.init_setup([['H2',L4,0],['H1',L2,1]]);
-	R4.init_setup([['H2',L5,0],['H1',L4,1]]);
+	R1.init_setup([['S1',L4,1],['S2',L0,1],['S3',L1,0],['T1',L1,0],['T2',L1,0],['T3',L1,0]]);
+	R2.init_setup([['S1',L1,1],['S2',L1,1],['S3',L2,0],['T1',L2,0],['T2',L5,0],['T3',L2,0]]);
+	R3.init_setup([['S1',L2,1],['S2',L2,1],['S3',L6,1],['T1',L3,0],['T2',L2,1],['T3',L3,0]]);
+	R4.init_setup([['S1',L3,1],['S2',L3,1],['S3',L3,1],['T1',L7,0],['T2',L3,1],['T3',L8,0]]);
 		
 	#Start of simulation.
 	global time_start
 	time_start = time.time()
-	H1.flow_init(0.5,'H2',20*10e5)	
-	time.sleep(1500)
+
+	t = _thread.start_new_thread(variable_poll,())
+
+	S1.flow_init(0.5,'T1',35*(10e4))	
+	S2.flow_init(10,'T2',15*(10e4))	
+	S3.flow_init(20,'T3',30*(10e4))	
+	time.sleep(190)
 	return
-		
+	
 def test_own():
 	H1 = Host('H1',30)
 	H2 = Host('H2',30)
