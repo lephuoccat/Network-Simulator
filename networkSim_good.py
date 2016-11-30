@@ -385,6 +385,104 @@ class Host(object):
 					break
 		return
 
+
+
+class TCPFast(object):
+    
+    '''Processes an acknowledgement packet and update window size for FAST TCP'''
+    def acknowledgement_received(self, packet):	
+        if self.wake_event != None:
+            self.event_scheduler.cancel_event(self.wake_event)
+        
+        # Check if this is a duplicate acknowledgement
+        if self.last_ack_received == packet.next_id:
+            self.duplicate_count += 1
+            keys = [key for key in self.not_acknowledged.keys() if key[0] == packet.next_id]
+            # After 3 duplicate acknowledgements, if the packet has not
+            # already been received, it has been dropped so it needs to be re-sent
+            if (self.duplicate_count == 3) and (len(keys) > 0):
+                expected = keys[0]
+                del self.not_acknowledged[(packet.next_id, expected[1])]
+                self.timed_out.append((packet.next_id, expected[1]))
+        else:
+            # reset duplicate count since the chain of dupACKS is broken
+            self.duplicate_count = 0
+
+        self.last_ack_received = packet.next_id
+
+        # This acknowledgement is for an unacknowledged packet
+        if (packet.identifier, packet.duplicate_num) in self.not_acknowledged.keys():
+            # calculate RTT of this packet
+            rtt = self.clock.current_time - self.not_acknowledged[(packet.identifier, packet.duplicate_num)]
+            # first packet, initialize base_RTT
+            if self.base_RTT == -1:
+                self.base_RTT = rtt
+            # update window size
+            self.cwnd = self.cwnd * self.base_RTT / rtt + self.alpha
+            # update minimum RTT
+            if rtt < self.base_RTT:
+                self.base_RTT = rtt
+            # Remove received packet from list of unacknowledged packets
+            del self.not_acknowledged[(packet.identifier, packet.duplicate_num)]
+
+        # Check for any unacknowledged packets that have timed out
+        for (packet_id, dup_num) in self.not_acknowledged.keys():
+            sent_time = self.not_acknowledged[(packet_id, dup_num)]
+            time_diff = self.clock.current_time - sent_time
+            if time_diff > self.timeout:
+                del self.not_acknowledged[(packet_id, dup_num)]
+                self.timed_out.append((packet_id, dup_num))
+        if len(self.timed_out) > 0:
+            self.retransmit = True
+            self.cwnd /= 2
+        else:
+            self.retransmit = False
+
+        self.send_packet()
+        self.wake_event = self.event_scheduler.delay_event(self.timeout, FlowWakeEvent(self.flow))
+
+    '''Sends packets while the number of packets in transit is within the window size'''
+    def send_packet(self):
+        if self.retransmit == True:
+            # send timed out packets. Their duplicate number will be incremented
+            while (len(self.not_acknowledged) < self.cwnd) and (len(self.timed_out) > 0):
+                (packet_id, dup_num) = self.timed_out[0]
+                self.not_acknowledged[(packet_id, dup_num + 1)] = self.clock.current_time
+                self.flow.send_a_packet(packet_id, dup_num + 1)
+                del self.timed_out[0]
+        else:
+            # send new packets
+            while (len(self.not_acknowledged) < self.cwnd) and (self.window_start * 1024 < self.flow.total):
+                self.not_acknowledged[(self.window_start, 0)] = self.clock.current_time
+                self.flow.send_a_packet(self.window_start, 0)
+                self.window_start += 1
+
+    '''Start sending packets when congestion control first begins or if the flow times out'''
+    def wake(self):
+        # Check for any unacknowledged packets that have timed out
+        for packet_id in self.not_acknowledged.keys():
+            sent_time = self.not_acknowledged[packet_id]
+            time_diff = self.clock.current_time - sent_time
+            if time_diff > self.timeout:
+                del self.not_acknowledged[packet_id]
+                self.timed_out.append(packet_id)
+            if len(self.timed_out) > 0:
+                self.retransmit = True
+            else:
+                self.retransmit = False
+                
+        self.cwnd /= 2
+        self.send_packet() 
+        self.wake_event = self.event_scheduler.delay_event(self.timeout, FlowWakeEvent(self.flow))    
+
+
+
+
+
+
+
+
+
 class Router(object):
 	def __init__(self,name,updateFreq):
 		self.name = name
