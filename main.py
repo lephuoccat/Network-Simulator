@@ -6,9 +6,8 @@ import queue
 import random
 
 global hostList
-hostList = list()
 global linkList 
-linkList = list()
+
 
 global pktSize 
 pktSize = 1000
@@ -91,7 +90,7 @@ class Host(object):
 		self.firstAck = 0
 		self.base_RTT = 0
 		self.curr_RTT = 0
-		self.rate_temp = 0
+		self.totPackets = 0
 		self.rate = 0
 		self.lastAckSent = -1
 		self.congestionAlgo = algo
@@ -102,8 +101,9 @@ class Host(object):
 		
 		_thread.start_new_thread(self.timeout_check,(self.timeout,))
 		_thread.start_new_thread(self.pkt_retransmit,())
+		_thread.start_new_thread(self.getRate,())
 		if self.congestionAlgo == 'FAST':
-			_thread.start_new_thread(self.change_window_fast,(1.0))
+			_thread.start_new_thread(self.change_window_fast,(0.05,))
 		return
 		
 	def __str__(self) :
@@ -113,11 +113,11 @@ class Host(object):
 		return self.__str__()
 
 	def getRate(self):
-		rate_arr = []
+		rate_temp = 0
 		while 1:
-			rate_arr.append(self.rate_temp)
-			self.rate = (sum(rate_arr[-11:-1])+rate_arr[-1])/0.05
-			time.sleep(0.005)
+			time.sleep(0.01)
+			self.rate = (self.totPackets-rate_temp)/0.01
+			rate_temp = self.totPackets
 		return
 		
 	#sets up the name and the end type of the outgoing link for the host.
@@ -177,7 +177,7 @@ class Host(object):
 	#Generates packet with size=pktSize & packet number=pktNum. Sends generated packet to 
 	#the outgoing link.
 	def pkt_gen(self,delay,dst,type,pktNum,pktSize):
-		self.rate_temp += 1
+		self.totPackets += 1
 		time.sleep(delay)
 		pkt = Packet(self.name,dst,type,pktNum,pktSize)
 		
@@ -224,6 +224,7 @@ class Host(object):
 					if retransmit == 1:
 						self.retransmitPhase = 1
 						#print('#','RETRANSMIT PHASE STARTED')
+						self.pktLossCnt += 1
 						while self.outstandingCnt >= self.window:
 							time.sleep(0.0001)
 						try:
@@ -398,16 +399,13 @@ class Host(object):
 		return
 	
 #Changes the window size depending on state(slow start/congestion avoidance) and on whether a packet loss occurred.
-	def change_window_fast(self,src,delay):
+	def change_window_fast(self,delay):
 		while 1:
 			time.sleep(delay)
 			self.windowChangeLock.acquire(1)
 			try:
-				if self.congestionAlgo == 'FAST':
-					if pktLoss:
-						self.sstart = 0
-					if self.curr_RTT != 0:
-						self.window = min(2*self.window, gamma*(self.base_RTT/self.curr_RTT * self.window + alpha)+(1-gamma)*self.window)
+				if self.curr_RTT != 0:
+					self.window = min(2*self.window, gamma*(self.base_RTT/self.curr_RTT * self.window + alpha)+(1-gamma)*self.window)
 			finally:
 				self.windowChangeLock.release()
 		return	
@@ -426,6 +424,7 @@ class Host(object):
 						#print('#','Timeout occured')
 						self.pktListLock.acquire(1)
 						try:
+							self.pktLossCnt += 1
 							self.pkt_gen(0,y[2],0,y[1],y[3])
 							for l in self.pktList:
 								if l[1] >= y[1]:
@@ -597,25 +596,25 @@ class Buffer(object):
 		self.drop_pkt = 0
 		self.itemsPut = 0
 		self.itemsPop = 0
-		self.lastpollTime = 0
 		self.rate = 0
-		self.rate_temp = 0
+		self.totPackets = 0
 		self.name = name
 		self.queueLock = threading.RLock()
 		_thread.start_new_thread(self.getRate,())
 		return
 
 	def getRate(self):
-		rate_arr = []
+		rate_temp = 0
 		while 1:
-			rate_arr.append(self.rate_temp)
-			self.rate = (sum(rate_arr[-11:-1])+rate_arr[-1])/0.05
-			time.sleep(0.005)
+			time.sleep(0.01)
+			self.rate = (self.totPackets-rate_temp)/0.01
+			rate_temp = self.totPackets
 		return
 		
 	#place a packet in the buffer if there is space
 	#drop the packet if space== 0
 	def put(self, packet, destination):
+		self.totPackets += 1
 		self.queueLock.acquire(1)
 		try:
 			if self.available_space >= packet.size:
@@ -632,7 +631,6 @@ class Buffer(object):
 		
 	#retrieve the next packet from the buffer in order.
 	def get(self):
-		self.rate_temp += 1
 		self.queueLock.acquire()
 		try:
 			(packet, destination) = self.queue.pop(0)
@@ -821,33 +819,48 @@ def test_poll():
 	
 def variable_poll():
 	dropStatList = list()
+	#hostDropList = list()
 	for item in linkList:
 		dropStatList.append([0,item])
+		
+	#for item10 in hostList:
+	#	hostDropList.append([0,item10])
 	while 1:
-		print("%0.2f" % (time.time()-time_start)+' ,',end = ' ')
+		print("%0.2f" % (time.time()-time_start)+',',end = ' ')
 		for item in hostList:
-			print(repr(item.window)+' ,',end = ' ')
+			print(repr(item.window)+',',end = ' ')
 			
 		for item1 in hostList:
-			print(repr(item1.curr_RTT-item1.base_RTT)+' ,',end = ' ')
+			print(repr(item1.curr_RTT-item1.base_RTT)+',',end = ' ')
 		
 		for item4 in hostList:
-			print(repr(item4.rate)+' ,',end = ' ')
+			print(repr(item4.rate)+',',end = ' ')
 		
 		for item5 in linkList:
-			print(repr(item5.buffer.rate)+' ,',end= ' ')	
+			print(repr(item5.buffer.rate)+',',end= ' ')	
 			
 		for item2 in linkList:
 			m = [y[1] for y in dropStatList].index(item2)
-			print(repr(item2.buffer.drop_pkt-dropStatList[m][0])+' ,',end = ' ')
+			print(repr(item2.buffer.drop_pkt - dropStatList[m][0])+',',end = ' ')
 			if dropStatList[m][0] != item2.buffer.drop_pkt:
 				dropStatList[m][0] = item2.buffer.drop_pkt
 		
 		for item3 in linkList:
 			if item3 != linkList[-1]:
-				print(repr(1-item3.buffer.available_space/(64000))+' ,',end = ' ')
+				print(repr(item3.buffer.size - item3.buffer.available_space)+',',end = ' ')
 			else:
-				print(repr(1-item3.buffer.available_space/(64000)))
+				print(repr(item3.buffer.size - item3.buffer.available_space))
+				#print(repr(item3.buffer.size - item3.buffer.available_space)+',',end = ' ')
+		
+		#for item6 in hostList:
+		#	n = [y[1] for y in hostDropList].index(item6)
+		#	if item6 != hostList[-1]:
+		#		print(repr(item6.pktLossCnt - hostDropList[n][0])+',',end = ' ')
+		#	else:
+		#		print(repr(item6.pktLossCnt - hostDropList[n][0]))
+		#	dropStatList[n][0] = item6.pktLossCnt
+				
+		print(' ')
 		time.sleep(0.01)
 	
 	# while 1:
@@ -884,7 +897,9 @@ def test0():
 	H1.link_setup(L1,0)
 	H2.link_setup(L1,1)
 		
+	global hostList 
 	hostList = [H1]
+	global linkList 
 	linkList = [L1]
 	
 	global alpha
@@ -899,7 +914,7 @@ def test0():
 	
 	H1.flow_init(1.0,'H2',20*(10e5))	
 	
-	time.sleep(500)
+	time.sleep(50)
 	return
 		
 def test1():
@@ -947,11 +962,16 @@ def test1():
 	#outgoing link end specification for hosts
 	H1.link_setup(L0,0)
 	H2.link_setup(L5,1)
-
+	
+	global hostList 
 	hostList = [H1]
+	global linkList 
 	linkList = [L0,L1,L2,L3,L4,L5]
 	
-	
+	global alpha
+	alpha = 15
+	global gamma
+	gamma = 0.5
 		
 	#Start of simulation.
 	global time_start
@@ -968,12 +988,15 @@ def test1():
 	
 	#t = _thread.start_new_thread(test_poll,())
 	H1.flow_init(0.5,'H2',20*(10e5))	
-	time.sleep(150)
+	time.sleep(300)
 	return
 	
 def test2():
 	global RTT
 	RTT = 0.06
+	
+	global RouterSwitch
+	RouterSwitch = 0
 	
 	#Host initialization.
 	global S1
@@ -1027,25 +1050,38 @@ def test2():
 	T2.link_setup(L5,1)
 	T3.link_setup(L8,1)
 	
+	global RouterNum
+	RouterNum = 4
+	
+	global hostList 
+	hostList = [S1,S2,S3]
+	global linkList 
+	linkList = [L0,L1,L2,L3,L4,L5,L6,L7,L8]
 	
 	# initiate routing table setup
-	R1.send_routing_table_to_neighbors()
-	R2.send_routing_table_to_neighbors()
-	R3.send_routing_table_to_neighbors()
-	R4.send_routing_table_to_neighbors()
+	#R1.send_routing_table_to_neighbors()
+	#R2.send_routing_table_to_neighbors()
+	#R3.send_routing_table_to_neighbors()
+	#R4.send_routing_table_to_neighbors()
+	
+	global alpha
+	alpha = 15
+	global gamma
+	gamma = 0.5
 	
 	#Start of simulation.
 	global time_start
 	time_start = time.time()
-
+	RouterSwitch = 1
+	
 	t = _thread.start_new_thread(variable_poll,())
 
 	S1.flow_init(0.5,'T1',35*(10e5))	
 	S2.flow_init(10,'T2',15*(10e5))	
 	S3.flow_init(20,'T3',30*(10e5))	
 	
-	time.sleep(1000)
+	time.sleep(200)
 
 	return
 
-test1()
+test2()
